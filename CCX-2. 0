@@ -1,0 +1,833 @@
+
+import os
+import ast
+import operator
+import asyncio
+import logging
+import sqlite3
+import aiohttp
+import discord
+
+from datetime import timedelta
+from discord import app_commands
+from discord.ext import commands
+from dotenv import load_dotenv
+
+# ==========================================
+# CCX 2.0 CONFIGURATION
+# ==========================================
+
+load_dotenv()
+
+TOKEN = os.getenv("MTU0MjQ4NTIxNTkyNDk4MTg1MQ.GH2XaA.fB4N4LzYfEleBg4NaaSk4I2R40lgwh109V6d9c")
+AI_KEY = os.getenv("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")
+AI_MODEL = os.getenv(
+    "OPENROUTER_MODEL",
+    "openai/gpt-4o-mini"
+)
+
+GUILD_ID = int(os.getenv("GUILD_ID", "0"))
+WELCOME_CHANNEL_ID = int(
+    os.getenv("WELCOME_CHANNEL_ID", "0")
+)
+SM_ROLE_ID = int(os.getenv("SM_ROLE_ID", "0"))
+
+if not TOKEN:
+    raise RuntimeError("DISCORD_TOKEN is missing.")
+
+if not AI_KEY:
+    raise RuntimeError("OPENROUTER_API_KEY is missing.")
+
+# ==========================================
+# LOGGING
+# ==========================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | CCX 2.0 | %(levelname)s | %(message)s"
+)
+
+logger = logging.getLogger("CCX")
+
+# ==========================================
+# DATABASE
+# No moderation logs or notification history
+# ==========================================
+
+db = sqlite3.connect("ccx_database.db")
+db.execute("""
+CREATE TABLE IF NOT EXISTS members (
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    joined_at TEXT
+)
+""")
+db.commit()
+
+# ==========================================
+# DISCORD INTENTS
+# ==========================================
+
+intents = discord.Intents.default()
+intents.members = True
+
+# ==========================================
+# MATH ENGINE
+# ==========================================
+
+MATH_OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+    ast.UAdd: operator.pos,
+    ast.USub: operator.neg
+}
+
+
+def calculate(expression: str):
+
+    expression = (
+        expression.replace("×", "*")
+        .replace("÷", "/")
+        .replace("^", "**")
+        .replace("−", "-")
+        .strip()
+    )
+
+    if not expression or len(expression) > 300:
+        raise ValueError("Invalid expression length.")
+
+    import re
+
+    if not re.fullmatch(r"[0-9+\-*/().%\s]+", expression):
+        raise ValueError("Invalid mathematical characters.")
+
+    tree = ast.parse(expression, mode="eval")
+
+    def evaluate(node):
+
+        if isinstance(node, ast.Expression):
+            return evaluate(node.body)
+
+        if isinstance(node, ast.Constant):
+            if type(node.value) in (int, float):
+                return node.value
+
+        if isinstance(node, ast.BinOp):
+
+            op_type = type(node.op)
+
+            if op_type not in MATH_OPERATORS:
+                raise ValueError("Unsupported operator.")
+
+            left = evaluate(node.left)
+            right = evaluate(node.right)
+
+            if op_type is ast.Pow:
+                if abs(right) > 100:
+                    raise ValueError("Exponent limit exceeded.")
+
+            result = MATH_OPERATORS[op_type](left, right)
+
+            if isinstance(result, int) and result.bit_length() > 4096:
+                raise ValueError("Result is too large.")
+
+            if isinstance(result, float):
+                if not __import__("math").isfinite(result):
+                    raise ValueError("Invalid numerical result.")
+
+            return result
+
+        if isinstance(node, ast.UnaryOp):
+
+            op_type = type(node.op)
+
+            if op_type not in MATH_OPERATORS:
+                raise ValueError("Invalid operator.")
+
+            return MATH_OPERATORS[op_type](
+                evaluate(node.operand)
+            )
+
+        raise ValueError("Invalid expression.")
+
+    return evaluate(tree)
+
+
+# ==========================================
+# AI ENGINE
+# ==========================================
+
+async def ask_ai(question: str):
+
+    url = "https://openrouter.ai/api/v1/chat/completions"
+
+    headers = {
+        "Authorization": f"Bearer {AI_KEY}",
+        "Content-Type": "application/json",
+        "X-Title": "CCX 2.0"
+    }
+
+    payload = {
+        "model": AI_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are CCX AI, the intelligent assistant "
+                    "of Code Creators X. You are helpful, "
+                    "technically knowledgeable and excellent "
+                    "at programming, science and mathematics. "
+                    "Give accurate, clear and useful responses. "
+                    "Never pretend to execute code you have "
+                    "not actually executed."
+                )
+            },
+            {
+                "role": "user",
+                "content": question
+            }
+        ],
+        "temperature": 0.5,
+        "max_tokens": 1500
+    }
+
+    timeout = aiohttp.ClientTimeout(total=45)
+
+    async with aiohttp.ClientSession(
+        timeout=timeout
+    ) as session:
+
+        async with session.post(
+            url,
+            headers=headers,
+            json=payload
+        ) as response:
+
+            if response.status != 200:
+                error = await response.text()
+                raise RuntimeError(
+                    f"AI provider error: {response.status}"
+                )
+
+            data = await response.json()
+
+            return data["choices"][0]["message"]["content"]
+
+
+# ==========================================
+# DISCORD BOT
+# ==========================================
+
+class CCXBot(commands.Bot):
+
+    async def setup_hook(self):
+
+        self.ai_semaphore = asyncio.Semaphore(5)
+
+        if GUILD_ID:
+            guild = discord.Object(id=GUILD_ID)
+            self.tree.copy_global_to(guild=guild)
+            await self.tree.sync(guild=guild)
+            logger.info("Guild commands synchronized.")
+        else:
+            await self.tree.sync()
+            logger.info("Global commands synchronized.")
+
+
+bot = CCXBot(
+    command_prefix="!",
+    intents=intents,
+    help_command=None
+)
+
+
+# ==========================================
+# HELPER: SEND PRIVATE DM
+# ==========================================
+
+async def send_dm(member, message):
+
+    try:
+        await member.send(message)
+        return True
+
+    except (discord.Forbidden, discord.HTTPException):
+        return False
+
+
+# ==========================================
+# MEMBER WELCOME SYSTEM
+# ==========================================
+
+@bot.event
+async def on_member_join(member):
+
+    db.execute(
+        """
+        INSERT OR REPLACE INTO members
+        (user_id, username, joined_at)
+        VALUES (?, ?, ?)
+        """,
+        (
+            member.id,
+            str(member),
+            discord.utils.utcnow().isoformat()
+        )
+    )
+    db.commit()
+
+    welcome = (
+        f"🚀 Welcome to **CCX**, {member.name}!\n\n"
+        "WE CODE. WE CREATE. WE BUILD. WE RISE.\n\n"
+        "Explore our coding community, participate in "
+        "challenges, showcase projects and connect with "
+        "other developers.\n\n"
+        "Enjoy your stay!"
+    )
+
+    await send_dm(member, welcome)
+
+    if WELCOME_CHANNEL_ID:
+        channel = bot.get_channel(WELCOME_CHANNEL_ID)
+
+        if channel:
+            await channel.send(
+                f"🎉 Welcome {member.mention} to **CCX!**"
+            )
+
+
+@bot.event
+async def on_member_remove(member):
+
+    db.execute(
+        "DELETE FROM members WHERE user_id = ?",
+        (member.id,)
+    )
+    db.commit()
+
+
+# ==========================================
+# READY EVENT
+# ==========================================
+
+@bot.event
+async def on_ready():
+
+    logger.info(
+        f"CCX 2.0 online as {bot.user}"
+    )
+
+    await bot.change_presence(
+        activity=discord.Activity(
+            type=discord.ActivityType.watching,
+            name="Code Creators X | /help"
+        )
+    )
+
+
+# ==========================================
+# AI COMMAND
+# ==========================================
+
+@bot.tree.command(
+    name="ask",
+    description="Ask CCX AI anything."
+)
+@app_commands.describe(
+    question="Your question for CCX AI"
+)
+async def ask_command(
+    interaction: discord.Interaction,
+    question: str
+):
+
+    await interaction.response.defer(
+        thinking=True
+    )
+
+    try:
+
+        async with bot.ai_semaphore:
+            answer = await ask_ai(question)
+
+        for start in range(0, len(answer), 1900):
+
+            await interaction.followup.send(
+                answer[start:start + 1900]
+            )
+
+    except Exception:
+        logger.exception("AI command failed.")
+
+        await interaction.followup.send(
+            "⚠️ CCX AI encountered a problem. "
+            "Please try again later."
+        )
+
+
+# ==========================================
+# MATHEMATICAL COMMAND
+# ==========================================
+
+@bot.tree.command(
+    name="calculate",
+    description="Calculate mathematical expressions."
+)
+@app_commands.describe(
+    expression="Mathematical expression"
+)
+async def calculate_command(
+    interaction: discord.Interaction,
+    expression: str
+):
+
+    try:
+
+        result = calculate(expression)
+
+        await interaction.response.send_message(
+            f"🧮 **CCX Mathematics Engine**\n"
+            f"Expression: `{expression}`\n"
+            f"Result: `{result}`"
+        )
+
+    except Exception as error:
+
+        await interaction.response.send_message(
+            f"⚠️ Calculation error: {error}",
+            ephemeral=True
+        )
+
+
+# ==========================================
+# MODERATION PERMISSION CHECK
+# ==========================================
+
+def moderator_only():
+    return app_commands.checks.has_permissions(
+        moderate_members=True
+    )
+
+
+# ==========================================
+# WARNING COMMAND
+# ==========================================
+
+@bot.tree.command(
+    name="warn",
+    description="Warn a CCX member."
+)
+@moderator_only()
+async def warn(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str
+):
+
+    await interaction.response.defer(ephemeral=True)
+
+    message = (
+        "⚠️ **CCX MODERATION WARNING**\n\n"
+        f"You have received a warning in CCX.\n"
+        f"Reason: {reason}\n"
+        f"Moderator: {interaction.user}\n\n"
+        "Please follow the community rules."
+    )
+
+    await send_dm(member, message)
+
+    await interaction.followup.send(
+        f"Warning processed for {member.mention}."
+    )
+
+
+# ==========================================
+# TIMEOUT COMMAND
+# ==========================================
+
+@bot.tree.command(
+    name="timeout",
+    description="Timeout a member."
+)
+@moderator_only()
+async def timeout(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    minutes: app_commands.Range[int, 1, 40320],
+    reason: str
+):
+
+    await interaction.response.defer(ephemeral=True)
+
+    if member.id == interaction.user.id:
+        await interaction.followup.send(
+            "You cannot timeout yourself."
+        )
+        return
+
+    if member.top_role >= interaction.user.top_role:
+        await interaction.followup.send(
+            "You cannot moderate this member because "
+            "their role is equal to or higher than yours."
+        )
+        return
+
+    await member.timeout(
+        timedelta(minutes=minutes),
+        reason=reason
+    )
+
+    await send_dm(
+        member,
+        "⏳ **CCX TIMEOUT NOTICE**\n\n"
+        "You have been timed out in CCX.\n"
+        f"Reason: {reason}\n"
+        f"Duration: {minutes} minutes\n"
+        f"Moderator: {interaction.user}"
+    )
+
+    await interaction.followup.send(
+        f"⏳ {member.mention} timed out for {minutes} minutes."
+    )
+
+
+# ==========================================
+# REMOVE TIMEOUT
+# ==========================================
+
+@bot.tree.command(
+    name="untimeout",
+    description="Remove a member's timeout."
+)
+@moderator_only()
+async def untimeout(
+    interaction: discord.Interaction,
+    member: discord.Member
+):
+
+    await member.timeout(
+        None,
+        reason=f"Timeout removed by {interaction.user}"
+    )
+
+    await send_dm(
+        member,
+        "✅ Your timeout in CCX has been removed."
+    )
+
+    await interaction.response.send_message(
+        f"Timeout removed for {member.mention}.",
+        ephemeral=True
+    )
+
+
+# ==========================================
+# KICK COMMAND
+# ==========================================
+
+@bot.tree.command(
+    name="kick",
+    description="Kick a member from CCX."
+)
+@app_commands.checks.has_permissions(kick_members=True)
+async def kick(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str
+):
+
+    if member.id == interaction.user.id:
+        await interaction.response.send_message(
+            "You cannot kick yourself.",
+            ephemeral=True
+        )
+        return
+
+    if member.top_role >= interaction.user.top_role:
+        await interaction.response.send_message(
+            "You cannot kick this member.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    await send_dm(
+        member,
+        "🚪 **CCX KICK NOTICE**\n\n"
+        f"You have been removed from CCX.\n"
+        f"Reason: {reason}\n"
+        f"Moderator: {interaction.user}"
+    )
+
+    await member.kick(reason=reason)
+
+    await interaction.followup.send(
+        f"{member} has been kicked."
+    )
+
+
+# ==========================================
+# BAN COMMAND
+# ==========================================
+
+@bot.tree.command(
+    name="ban",
+    description="Ban a member from CCX."
+)
+@app_commands.checks.has_permissions(ban_members=True)
+async def ban(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str
+):
+
+    if member.id == interaction.user.id:
+        await interaction.response.send_message(
+            "You cannot ban yourself.",
+            ephemeral=True
+        )
+        return
+
+    if member.top_role >= interaction.user.top_role:
+        await interaction.response.send_message(
+            "You cannot ban this member.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    await send_dm(
+        member,
+        "🔨 **CCX BAN NOTICE**\n\n"
+        "You have been banned from CCX.\n"
+        f"Reason: {reason}\n"
+        f"Moderator: {interaction.user}"
+    )
+
+    await member.ban(
+        reason=reason,
+        delete_message_seconds=0
+    )
+
+    await interaction.followup.send(
+        f"{member} has been banned."
+    )
+
+
+# ==========================================
+# UNBAN COMMAND
+# ==========================================
+
+@bot.tree.command(
+    name="unban",
+    description="Unban a Discord user."
+)
+@app_commands.checks.has_permissions(ban_members=True)
+async def unban(
+    interaction: discord.Interaction,
+    user_id: str
+):
+
+    try:
+        target = await bot.fetch_user(int(user_id))
+
+        await interaction.guild.unban(
+            target,
+            reason=f"Unbanned by {interaction.user}"
+        )
+
+        await send_dm(
+            target,
+            "✅ Your ban from CCX has been lifted."
+        )
+
+        await interaction.response.send_message(
+            f"{target} has been unbanned.",
+            ephemeral=True
+        )
+
+    except (ValueError, discord.NotFound):
+        await interaction.response.send_message(
+            "User not found or not banned.",
+            ephemeral=True
+        )
+
+
+# ==========================================
+# SM ROLE COMMAND
+# ==========================================
+
+@bot.tree.command(
+    name="sm",
+    description="Assign the Suspicious Member role."
+)
+@moderator_only()
+async def suspicious_member(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str
+):
+
+    if not SM_ROLE_ID:
+        await interaction.response.send_message(
+            "SM_ROLE_ID has not been configured.",
+            ephemeral=True
+        )
+        return
+
+    role = interaction.guild.get_role(SM_ROLE_ID)
+
+    if not role:
+        await interaction.response.send_message(
+            "SM role not found.",
+            ephemeral=True
+        )
+        return
+
+    if role >= interaction.guild.me.top_role:
+        await interaction.response.send_message(
+            "The bot's role must be above the SM role.",
+            ephemeral=True
+        )
+        return
+
+    await member.add_roles(
+        role,
+        reason=reason
+    )
+
+    await send_dm(
+        member,
+        "⚠️ **CCX SECURITY NOTICE**\n\n"
+        "Your account has been assigned the "
+        "**Suspicious Member (SM)** role.\n\n"
+        f"Reason: {reason}\n\n"
+        "Some community features may be restricted. "
+        "Please contact Galibriix, CCX moderator, "
+        "for assistance."
+    )
+
+    await interaction.response.send_message(
+        f"SM role assigned to {member.mention}.",
+        ephemeral=True
+    )
+
+
+# ==========================================
+# HELP COMMAND
+# ==========================================
+
+@bot.tree.command(
+    name="help",
+    description="View CCX 2.0 commands."
+)
+async def help_command(
+    interaction: discord.Interaction
+):
+
+    embed = discord.Embed(
+        title="🚀 CCX 2.0 Command Centre",
+        description="Your Code Creators X assistant.",
+        color=discord.Color.blurple()
+    )
+
+    embed.add_field(
+        name="AI & Mathematics",
+        value="/ask\n/calculate",
+        inline=False
+    )
+
+    embed.add_field(
+        name="Moderation",
+        value=(
+            "/warn\n/timeout\n/untimeout\n"
+            "/kick\n/ban\n/unban\n/sm"
+        ),
+        inline=False
+    )
+
+    embed.set_footer(
+        text="WE CODE. WE CREATE. WE BUILD. WE RISE."
+    )
+
+    await interaction.response.send_message(
+        embed=embed,
+        ephemeral=True
+    )
+
+
+# ==========================================
+# ERROR HANDLER
+# ==========================================
+
+@bot.tree.error
+async def command_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError
+):
+
+    if isinstance(
+        error,
+        app_commands.MissingPermissions
+    ):
+        message = "⛔ You don't have permission to use this command."
+
+    elif isinstance(
+        error,
+        app_commands.BotMissingPermissions
+    ):
+        message = "⚠️ CCX lacks the required Discord permissions."
+
+    elif isinstance(
+        error,
+        app_commands.CommandOnCooldown
+    ):
+        message = "Please wait before using this command again."
+
+    else:
+        logger.exception(
+            "Command error",
+            exc_info=error
+        )
+        message = "Something went wrong. Please try again."
+
+    if interaction.response.is_done():
+        await interaction.followup.send(
+            message,
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            message,
+            ephemeral=True
+        )
+
+
+# ==========================================
+# START CCX 2.0
+# ==========================================
+
+async def main():
+
+    try:
+        async with bot:
+            await bot.start(TOKEN)
+
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+
+    try:
+        asyncio.run(main())
+
+    except KeyboardInterrupt:
+        logger.info("CCX 2.0 shutting down.")
